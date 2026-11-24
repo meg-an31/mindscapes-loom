@@ -20,7 +20,7 @@ type ForkCounts = Map<string, number>;
 /**
  * The conversation as bubbles. One bubble is everything one voice says before the other speaks:
  * pieces in the same voice always join, whatever nodes they sit in, so no voice ever has two
- * bubbles in a row (the model reads it the same way, see turnsOf). A message with no words is not
+ * bubbles in a row (the model reads it the same way, see bubblesOf and turnsFor in the store). A message with no words is not
  * drawn, unless the model is about to write it.
  */
 function useConversation(headId: string) {
@@ -101,6 +101,14 @@ function RobotButton({ tabId, voice, off }: { tabId: string; voice: Role; off: b
   );
 }
 
+/** What the server says while a generation waits to start (a model booting, a queue). */
+function GenStatus({ bubble }: { bubble: Bubble }) {
+  const p = bubble.pieces.find((x) => x.generating);
+  const text = useUi((s) => (p ? s.status[`${p.nodeId}:${p.msg}`] : undefined));
+  if (!text) return null;
+  return <span className="gen-status">{text}</span>;
+}
+
 const BubbleView = memo(function BubbleView({ bubble, forks, waiting, tail }: { bubble: Bubble; forks: ForkCounts; waiting?: boolean; tail?: ReactNode }) {
   const generating = bubble.pieces.some((p) => p.generating);
   return (
@@ -127,6 +135,7 @@ const BubbleView = memo(function BubbleView({ bubble, forks, waiting, tail }: { 
           });
         })}
         {generating && (waiting ? <span className="waiting">waiting for its turn…</span> : <span className="caret" aria-hidden="true" />)}
+        {generating && !waiting && <GenStatus bubble={bubble} />}
         {tail}
       </p>
     </div>
@@ -355,6 +364,8 @@ function Messages({ tab }: { tab: Tab }) {
   }).split(',').filter(Boolean);
   // the model writes one message at a time: the others wait their turn
   const writing = useLoom((s) => s.streamOrder[0]);
+  // only the in-page model queues; other backends write side by side
+  const queued = useLoom((s) => s.streamOrder);
   const busy = useLoom((s) => !!s.nodes[tab.headId]?.messages.some((m) => m.generating));
   const auto = useChatPrefs((s) => s.autoPrompt);
   const menuOpenedAt = useRef(0);
@@ -467,7 +478,7 @@ function Messages({ tab }: { tab: Tab }) {
             <BubbleView
               bubble={b}
               forks={forks}
-              waiting={!!live && `${live.nodeId}:${live.msg}` !== writing}
+              waiting={!!live && queued.includes(`${live.nodeId}:${live.msg}`) && `${live.nodeId}:${live.msg}` !== writing}
               tail={end && !auto ? <RobotButton tabId={tab.id} voice={b.role} off={busy} /> : undefined}
             />
             {tree && <ForkTree kids={endKids} onPick={(id) => useLoom.getState().goToNode(tab.id, id)} />}

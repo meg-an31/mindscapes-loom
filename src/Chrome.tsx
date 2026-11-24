@@ -1,5 +1,7 @@
 import { ModelPill } from './model/ModelPill';
 import { useLoom } from './store';
+import { SettingsButton } from './SettingsPanel';
+import { useSettings } from './settings';
 import { TITLE_EYES, TITLE_INK, TITLE_SLASH, TITLE_VIEWBOX } from './mindscapesTitle';
 
 /* The only controls outside the canvas tools: floating over the canvas's top corners. */
@@ -55,11 +57,13 @@ export function ChromeLeft() {
 /** Top right of the canvas: the model, then undo and redo. */
 export function ChromeRight() {
   const canUndo = useLoom((s) => s.past.length > 0);
+  // the in-browser model's state, while it is one of the models in use
+  const browserOn = useSettings((s) => s.models.some((m) => m.on && m.mode === 'browser'));
   const canRedo = useLoom((s) => s.future.length > 0);
   const L = useLoom.getState();
   return (
     <div className="chrome chrome-right">
-      <ModelPill />
+      {browserOn && <ModelPill />}
       <button className="icon-btn big" onClick={() => L.undo()} disabled={!canUndo} title="Undo (ctrl z)" aria-label="Undo">
         <svg viewBox="0 0 20 20" width="17" height="17" aria-hidden="true">
           <path d="M7 5 3 9l4 4M3.5 9H12a4.5 4.5 0 0 1 0 9H9" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
@@ -70,6 +74,7 @@ export function ChromeRight() {
           <path d="m13 5 4 4-4 4M16.5 9H8a4.5 4.5 0 0 0 0 9h3" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
         </svg>
       </button>
+      <SettingsButton />
     </div>
   );
 }

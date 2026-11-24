@@ -11,7 +11,7 @@ import { AutoTokenizer, env } from '@huggingface/transformers';
 const out = join(mkdtempSync(join(tmpdir(), 'loom-check-')), 'bundle.mjs');
 await build({
   stdin: {
-    contents: `export { piecesFor } from './src/store'; export { turnsOf } from './src/generate'; export { buildPrompt } from './src/model/prompt';`,
+    contents: `export { turnsFor, bubblesOf } from './src/store'; export { buildPrompt } from './src/model/prompt';`,
     resolveDir: process.cwd(),
     loader: 'ts',
   },
@@ -21,7 +21,12 @@ await build({
   outfile: out,
   logLevel: 'error',
 });
-const { piecesFor, turnsOf, buildPrompt } = await import(pathToFileURL(out).href);
+const { turnsFor, bubblesOf, buildPrompt } = await import(pathToFileURL(out).href);
+// what the in-page model is sent (generate.ts, browser mode): empty turns dropped except the last
+const chatTurns = (nodes, id) =>
+  turnsFor(nodes, id)
+    .filter((t, i, all) => t.text || i === all.length - 1)
+    .map((t) => ({ role: t.role === 'model' ? 'assistant' : 'user', content: t.text }));
 
 if (process.argv[2]) env.cacheDir = process.argv[2];
 const tok = await AutoTokenizer.from_pretrained('onnx-community/Qwen2.5-0.5B-Instruct');
@@ -53,7 +58,7 @@ const nodes = {
 const sys = '<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n';
 const u = (t) => `<|im_start|>user\n${t}<|im_end|>\n`;
 const a = (t, open) => `<|im_start|>assistant\n${t}${open ? '' : '<|im_end|>\n'}`;
-const prompt = (id, system) => buildPrompt(tok, turnsOf(piecesFor(nodes, id)), system);
+const prompt = (id, system) => buildPrompt(tok, chatTurns(nodes, id), system);
 
 let p = prompt('a');
 assert.equal(p.text, sys + u('tell me about tide pools') + a(reply) + u('stranger please') + a('', true));
@@ -88,7 +93,11 @@ p = buildPrompt(tok, [{ role: 'user', content: 'write about ' }]);
 assert.equal(p.text, sys + '<|im_start|>user\nwrite about');
 
 // one voice never has two turns in a row: its messages reach the model as one turn, nothing between
-const turns = (list) => turnsOf(list.map(([role, text]) => ({ role, text })));
+// the last piece is the message the model writes into: in the loom it is the one being generated
+const turns = (list) =>
+  bubblesOf(list.map(([role, text], i) => ({ role, text, generating: i === list.length - 1 })))
+    .map((b) => ({ role: b.role === 'model' ? 'assistant' : 'user', content: b.pieces.map((p) => p.text).join('') }))
+    .filter((t, i, all) => t.content || i === all.length - 1);
 p = buildPrompt(tok, turns([['user', 'one'], ['user', '\ntwo'], ['model', 'a b'], ['model', ' c'], ['user', 'three'], ['model', '']]));
 assert.equal(p.text, sys + u('one\ntwo') + a('a b c') + u('three') + a('', true));
 // a message with no words is no turn (an old open slot, a branch left empty)
