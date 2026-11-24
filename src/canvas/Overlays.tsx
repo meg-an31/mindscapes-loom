@@ -165,7 +165,8 @@ export function Toast() {
   useEffect(() => {
     if (!toast) return;
     setVisible(true);
-    const t = setTimeout(() => setVisible(false), 2600);
+    // long enough to read: errors can run to a sentence or two
+    const t = setTimeout(() => setVisible(false), Math.min(9000, 2600 + toast.text.length * 45));
     return () => clearTimeout(t);
   }, [toast]);
   if (!toast || !visible) return null;
