@@ -5,6 +5,7 @@ import { Canvas } from './canvas/Canvas';
 import { NodeMenu, NodeTooltip, Toast } from './canvas/Overlays';
 import { MobileChat, Sidebar } from './chat/Sidebar';
 import { sideWidth, useLoom } from './store';
+import { SettingsPanel } from './SettingsPanel';
 
 /** ctrl/cmd + z undoes, ctrl/cmd + y or ctrl/cmd + shift + z redoes. Text fields keep their own undo. */
 function useUndoKeys() {
@@ -60,6 +61,7 @@ export function App() {
             </>
           )}
         </main>
+        <SettingsPanel />
         <NodeTooltip />
         <NodeMenu />
         <Toast />

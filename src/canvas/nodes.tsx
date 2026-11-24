@@ -69,6 +69,8 @@ export const LoomNodeView = memo(function LoomNodeView({ id, data }: NodeProps<L
   const p = preview(node.messages);
   const generating = node.messages.some((m) => m.generating);
   const count = node.messages.length;
+  // the model that wrote the node's latest text
+  const model = node.messages.flatMap((m) => m.spans ?? []).reduce<string | undefined>((a, sp) => sp.model ?? a, undefined);
   const style = {
     '--c': c.core,
     '--f': c.fringe,
@@ -85,6 +87,7 @@ export const LoomNodeView = memo(function LoomNodeView({ id, data }: NodeProps<L
       data-picked={picked || undefined}
       data-linked={linked || undefined}
       data-generating={generating || undefined}
+      data-model={model ? '' : undefined}
       style={style}
       {...g}
     >
@@ -105,6 +108,11 @@ export const LoomNodeView = memo(function LoomNodeView({ id, data }: NodeProps<L
         <p className="lnode-head">
           <em className="lnode-empty">empty</em>
         </p>
+      )}
+      {model && (
+        <span className="lnode-model" title={`written by ${model}`}>
+          {model}
+        </span>
       )}
       <HiddenBadge id={id} />
       <Handle type="source" position={Position.Bottom} isConnectable={false} />

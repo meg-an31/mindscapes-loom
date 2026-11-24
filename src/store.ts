@@ -1,5 +1,7 @@
 import { create } from 'zustand';
-import { streamCompletion, type StreamHandle } from './generate';
+import { generate, type PlacedToken, type StreamHandle, type Turn } from './generate';
+import { apiKeyFor, pickModel, useSettings } from './settings';
+import { sliceGen, type Span, type TokInfo } from './tokens';
 
 /*
  * Data model
@@ -18,6 +20,10 @@ export interface Message {
   role: Role;
   text: string;
   generating?: boolean;
+  /** the model's tokens and probabilities for the parts it wrote (see tokens.ts) */
+  toks?: TokInfo[];
+  /** which model wrote which part, and when */
+  spans?: Span[];
 }
 
 /** Where a child cut its parent: everything before `offset` in message `msg` is kept. */
@@ -115,6 +121,10 @@ const uid = (p: string) => `${p}${Date.now().toString(36)}${(idSeq++).toString(3
 const streams = new Map<string, StreamHandle>();
 /** the message each live generation writes into; a node split above it moves it (see splitNode) */
 const targets = new Map<string, { id: string; msg: number }>();
+/** the generations run by the in-page model (by their target): it writes one at a time, so they queue */
+const inPage = new WeakSet<{ id: string; msg: number }>();
+/** the in-page generations' keys, oldest first */
+const pageOrder = () => [...streams.keys()].filter((k) => inPage.has(targets.get(k)!));
 const streamKey = (id: string, msg: number) => `${id}:${msg}`;
 
 type Nodes = Record<string, LoomNode>;
@@ -146,7 +156,8 @@ export interface LoomState {
   tabCounter: number;
   colorCounter: number;
   focusRequest: { tabId: string; n: number } | null;
-  /** the keys of the live generations, oldest first: the first is being written, the others wait */
+  /** the in-page model's live generations, oldest first: the first is being written, the others wait
+   *  (other backends write side by side, so theirs never wait here) */
   streamOrder: string[];
   toast: { text: string; n: number } | null;
   past: Snapshot[];
@@ -163,7 +174,16 @@ export interface LoomState {
   /** new empty leaf child, opened in chat so you can type its first message */
   forkForWriting(nodeId: string, pos?: { x: number; y: number }): void;
   /** fork at a point and either let the model write the next message ('generate') or leave it for you ('write') */
-  forkAtPoint(tabId: string, nodeId: string, msg: number, offset: number, kind: 'generate' | 'write', count?: number): void;
+  forkAtPoint(
+    tabId: string,
+    nodeId: string,
+    msg: number,
+    offset: number,
+    kind: 'generate' | 'write',
+    count?: number,
+    /** start the new branch with this model token (one of the alternatives the model had here), then carry on */
+    seed?: { tok: { t: string; lp: number; top?: [string, number][] }; model?: string },
+  ): void;
   /**
    * Add what you typed to the end of a chat, in a voice. Two messages in one voice never follow
    * each other: the text joins the last message when that one is in the same voice. `auto`: the
@@ -225,6 +245,9 @@ export interface Piece {
   /** true when this piece is the whole message (so an end-of-message fork can be shown after it) */
   whole: boolean;
   generating: boolean;
+  /** the message's token data; offsets are message offsets, and the piece starts at offset 0 */
+  toks?: TokInfo[];
+  spans?: Span[];
 }
 
 /** The conversation you see when standing in `headId`. */
@@ -237,7 +260,7 @@ export function piecesFor(nodes: Nodes, headId: string): Piece[] {
     const upto = cut ? cut.msg : n.messages.length;
     for (let k = 0; k < Math.min(upto, n.messages.length); k++) {
       const m = n.messages[k];
-      out.push({ nodeId: n.id, msg: k, role: m.role, text: m.text, whole: true, generating: !!m.generating });
+      out.push({ nodeId: n.id, msg: k, role: m.role, text: m.text, whole: true, generating: !!m.generating, toks: m.toks, spans: m.spans });
     }
     if (cut && n.messages[cut.msg]) {
       const m = n.messages[cut.msg];
@@ -250,10 +273,40 @@ export function piecesFor(nodes: Nodes, headId: string): Piece[] {
           text,
           whole: cut.offset >= m.text.length,
           generating: false,
+          toks: m.toks,
+          spans: m.spans,
         });
     }
   }
   return out;
+}
+
+/** One bubble: everything one voice says before the other speaks. */
+export interface Bubble {
+  role: Role;
+  pieces: Piece[];
+}
+
+/**
+ * The conversation as bubbles. One bubble is everything one voice says before the other speaks:
+ * pieces in the same voice always join, whatever nodes they sit in, so no voice ever has two
+ * bubbles in a row. A message with no words is left out, unless the model is about to write it.
+ * The chat shows these and the model is sent these, so both agree on where a message ends.
+ */
+export function bubblesOf(pieces: Piece[]): Bubble[] {
+  const bubbles: Bubble[] = [];
+  for (const p of pieces) {
+    if (!p.text && !p.generating) continue;
+    const last = bubbles[bubbles.length - 1];
+    if (last && last.role === p.role) last.pieces.push(p);
+    else bubbles.push({ role: p.role, pieces: [p] });
+  }
+  return bubbles;
+}
+
+/** The conversation up to and including nodes[id], as the turns a model is sent; the last is the one it writes into. */
+export function turnsFor(nodes: Nodes, id: string): Turn[] {
+  return bubblesOf(piecesFor(nodes, id)).map((b) => ({ role: b.role, text: b.pieces.map((p) => p.text).join('') }));
 }
 
 /** The voice of the last words of the conversation you see when standing in `headId` (null: nothing is written yet). */
@@ -417,8 +470,9 @@ function seed() {
 
 // ---------- persistence ----------
 
-const SAVE_KEY = 'mindscapes-loom-interview-v1'; // its own: this fork shares a site with the loom
-const OLD_SAVE_KEY = 'mindscapes-loom-interview-v0'; // never written: the loom's old saves are not ours to read
+// the interview build shares a site with the loom: its saves are its own, and the loom's are not ours to read
+const SAVE_KEY = 'mindscapes-loom-interview-v1';
+const OLD_SAVE_KEY = 'mindscapes-loom-interview-v0'; // never written
 type Saved = ReturnType<typeof seed>;
 
 function load(): Saved | null {
@@ -488,6 +542,19 @@ function settleWindows(tabs: Tab[], windows: Win[], activeWindowId: string | nul
   return { tabs: tinted, windows: coloured, activeWindowId: aw?.id ?? null, activeTabId: aw?.activeTabId ?? null };
 }
 
+/**
+ * Add streamed text to the end of a message, growing its last span (the stream's). Tokens are
+ * placed from that span's start: they may cover text that arrived in an earlier chunk.
+ */
+function appendGen(m: Message, text: string, toks?: PlacedToken[]): Message {
+  const spans = m.spans?.slice() ?? [];
+  const last = spans[spans.length - 1];
+  const base = last ? last.s : m.text.length;
+  if (last) spans[spans.length - 1] = { ...last, e: m.text.length + text.length };
+  const add: TokInfo[] = (toks ?? []).map((k) => ({ o: base + k.o, t: k.t, lp: k.lp, ...(k.top ? { top: k.top } : {}) }));
+  return { ...m, text: m.text + text, toks: add.length ? [...(m.toks ?? []), ...add] : m.toks, spans: spans.length ? spans : undefined };
+}
+
 // ---------- store ----------
 
 export const useLoom = create<LoomState>()((set, get) => {
@@ -497,7 +564,7 @@ export const useLoom = create<LoomState>()((set, get) => {
     streams.delete(key);
     targets.delete(key);
   };
-  const syncOrder = () => set({ streamOrder: [...streams.keys()] });
+  const syncOrder = () => set({ streamOrder: pageOrder() });
 
   const snap = (): Snapshot => {
     const s = get();
@@ -556,14 +623,56 @@ export const useLoom = create<LoomState>()((set, get) => {
     syncOrder();
   };
 
-  /** Stream the model's words into nodes[id].messages[msg]. What it reads is fixed now, also when it has to wait its turn. */
-  const startStream = (id: string, msg: number) => {
+  /**
+   * Stream the model's words into nodes[id].messages[msg], the last message of the conversation
+   * at `id`. What it reads is fixed now, also when it has to wait its turn. `prefer` names a model
+   * (by label) to use if it is switched on. `at` follows the message if a split above moves it.
+   */
+  const startStream = (id: string, msg: number, prefer?: string) => {
+    const nodes = get().nodes;
+    const own = nodes[id]?.messages[msg];
+    if (!own) return;
     const at = { id, msg };
-    const h = streamCompletion(
-      piecesFor(get().nodes, id),
-      (chunk) => patchMessage(at.id, at.msg, (m) => (m.generating ? { ...m, text: m.text + chunk } : m)),
-      () => endStream(at),
+    const profile = pickModel(prefer);
+    if (!profile) {
+      endStream(at);
+      get().showToast('No model is switched on. Open settings (the gear, top right) to pick one.');
+      return;
+    }
+    const pieces = piecesFor(nodes, id);
+    const turns = turnsFor(nodes, id);
+    // demo only: carrying on text that doesn't end in a space starts with one
+    const prev = own.text ? { role: own.role, text: own.text } : pieces[pieces.length - 2];
+    const leadingSpace = !!prev && (own.text ? true : prev.role === own.role) && prev.text.length > 0 && !/\s$/.test(prev.text);
+    // a message that starts a turn of its own drops the whitespace a model writes after "Assistant:"
+    const trimStart = !turns[turns.length - 1]?.text;
+    const st = useSettings.getState();
+    const span: Span = { s: own.text.length, e: own.text.length, model: profile.label, at: Date.now(), temp: st.sampling.temperature };
+    patchMessage(id, msg, (m) => ({ ...m, generating: true, spans: [...(m.spans ?? []), span] }));
+    const statusKey = () => streamKey(at.id, at.msg);
+    const h = generate(
+      { turns, profile, sampling: st.sampling, format: st.format, apiKey: apiKeyFor(profile), leadingSpace, trimStart, onStatus: (t) => setStatus(statusKey(), t) },
+      (text, toks) => {
+        setStatus(statusKey(), null);
+        patchMessage(at.id, at.msg, (m) => (m.generating ? appendGen(m, text, toks) : m));
+      },
+      (info) => {
+        setStatus(statusKey(), null);
+        patchMessage(at.id, at.msg, (m) => {
+          // the stream's span is the last one; drop it if nothing was written
+          const spans = (m.spans ?? []).slice();
+          const last = spans[spans.length - 1];
+          if (last && last.at === span.at) {
+            if (last.e <= last.s) spans.pop();
+            else spans[spans.length - 1] = { ...last, ...(info.finish ? { finish: info.finish } : {}) };
+          }
+          return { ...m, spans: spans.length ? spans : undefined };
+        });
+        endStream(at);
+        if (info.error) get().showToast(`Generation failed: ${info.error}`);
+      },
     );
+    if (profile.mode === 'browser') inPage.add(at);
     streams.set(streamKey(id, msg), h);
     targets.set(streamKey(id, msg), at);
     syncOrder();
@@ -593,9 +702,9 @@ export const useLoom = create<LoomState>()((set, get) => {
     const s = get();
     const N = s.nodes[id];
     const m = N.messages[msg];
-    const before: Message[] = [...N.messages.slice(0, msg), ...(offset > 0 ? [{ ...m, text: m.text.slice(0, offset) }] : [])];
+    const before: Message[] = [...N.messages.slice(0, msg), ...(offset > 0 ? [sliceGen(m, 0, offset)] : [])];
     const partial = offset < m.text.length; // does the suffix start part-way through message `msg`?
-    const after: Message[] = [...(partial ? [{ ...m, text: m.text.slice(offset) }] : []), ...N.messages.slice(msg + 1)];
+    const after: Message[] = [...(partial ? [sliceGen(m, offset)] : []), ...N.messages.slice(msg + 1)];
     const sufId = uid('n');
     const shift = NODE_H + GAP_Y;
     const nodes: Nodes = { ...s.nodes };
@@ -641,7 +750,7 @@ export const useLoom = create<LoomState>()((set, get) => {
       streams.set(key, h);
       targets.set(key, at);
     }
-    set({ nodes, children, tabs, structure: s.structure + 1, streamOrder: [...streams.keys()] });
+    set({ nodes, children, tabs, structure: s.structure + 1, streamOrder: pageOrder() });
     return sufId;
   };
 
@@ -757,7 +866,7 @@ export const useLoom = create<LoomState>()((set, get) => {
       get().openInChat(id, true);
     },
 
-    forkAtPoint(tabId, nodeId, msg, offset, kind, count = 1) {
+    forkAtPoint(tabId, nodeId, msg, offset, kind, count = 1, seed) {
       const N = get().nodes[nodeId];
       if (!N?.messages[msg]) return;
       if (N.messages[msg].generating) {
@@ -789,13 +898,35 @@ export const useLoom = create<LoomState>()((set, get) => {
         voice = offset > 0 ? 'model' : N.messages[msg].role;
       }
       let id = '';
-      for (let i = 0; i < (kind === 'generate' ? count : 1); i++) {
-        id =
-          kind === 'generate'
-            ? addChild(parent, at, [{ role: voice, text: '', generating: true }])
-            : addChild(parent, at, []);
-        if (kind === 'generate') startStream(id, 0);
-      }
+      if (seed && kind === 'generate') {
+        const { t, lp, top } = seed.tok;
+        id = addChild(parent, at, [
+          {
+            // the voice of the message the token was in (the model may have been writing as you)
+            role: N.messages[msg].role,
+            text: t,
+            toks: [{ o: 0, t, lp, ...(top ? { top } : {}) }],
+            spans: [{ s: 0, e: t.length, model: seed.model ?? 'model', at: Date.now() }],
+            generating: true,
+          },
+        ]);
+        // the token starts a message of its own: drop its leading space, as a fresh reply would
+        const turns = turnsFor(get().nodes, id);
+        if (turns[turns.length - 1]?.text === t && /^\s/.test(t)) {
+          const n = get().nodes[id];
+          const body = t.trimStart();
+          const m: Message = { ...n.messages[0], text: body, toks: [{ o: 0, t: body, lp, ...(top ? { top } : {}) }], spans: [{ ...n.messages[0].spans![0], e: body.length }] };
+          set((st) => ({ nodes: { ...st.nodes, [id]: { ...n, messages: [m] } } }));
+        }
+        startStream(id, 0, seed.model);
+      } else
+        for (let i = 0; i < (kind === 'generate' ? count : 1); i++) {
+          id =
+            kind === 'generate'
+              ? addChild(parent, at, [{ role: voice, text: '', generating: true }])
+              : addChild(parent, at, []);
+          if (kind === 'generate') startStream(id, 0);
+        }
       setHead(tabId, id);
       if (kind === 'write') set({ focusRequest: { tabId, n: Date.now() } });
     },
@@ -1131,6 +1262,8 @@ interface UiState {
   linkHover: string | null;
   /** the nodes picked with the arrow tool */
   selection: string[];
+  /** what the server says while a generation waits to start, by `${nodeId}:${msg}` */
+  status: Record<string, string>;
   /** a box being dragged out with the arrow tool, in canvas-element pixels */
   marquee: { x0: number; y0: number; x1: number; y1: number } | null;
   /** a tab being dragged, and where it would land */
@@ -1153,8 +1286,18 @@ export const useUi = create<UiState>()((set) => ({
   selection: [],
   marquee: null,
   linkHover: null,
+  status: {},
   set: (p) => set(p),
 }));
+
+function setStatus(key: string, text: string | null) {
+  const cur = useUi.getState().status;
+  if ((cur[key] ?? null) === text) return;
+  const status = { ...cur };
+  if (text === null) delete status[key];
+  else status[key] = text;
+  useUi.getState().set({ status });
+}
 
 export function exportMarkdown(nodes: Nodes, id: string): string {
   const out: string[] = [];

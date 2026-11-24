@@ -1,5 +1,7 @@
 import { Fragment, memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode, type RefObject } from 'react';
-import { MAX_WINDOWS, colorOf, divergingToken, lastVoice, pathTo, piecesFor, useLoom, useUi, type Role, type Tab, type Win } from '../store';
+import { MAX_WINDOWS, bubblesOf, colorOf, divergingToken, lastVoice, pathTo, piecesFor, useLoom, useUi, type Role, type Tab, type Win } from '../store';
+import { useSettings } from '../settings';
+import { minProb, pct, showTok, spanAt, tokenAt, type TokInfo } from '../tokens';
 import { useIsMobile } from '../useIsMobile';
 import { tokenize } from '../text';
 import { SidebarToggle } from '../Chrome';
@@ -20,20 +22,15 @@ type ForkCounts = Map<string, number>;
 /**
  * The conversation as bubbles. One bubble is everything one voice says before the other speaks:
  * pieces in the same voice always join, whatever nodes they sit in, so no voice ever has two
- * bubbles in a row (the model reads it the same way, see turnsOf). A message with no words is not
+ * bubbles in a row (the model reads it the same way, see bubblesOf and turnsFor in the store). A message with no words is not
  * drawn, unless the model is about to write it.
  */
 function useConversation(headId: string) {
   const nodes = useLoom((s) => s.nodes);
   const children = useLoom((s) => s.children);
   return useMemo(() => {
-    const bubbles: Bubble[] = [];
-    for (const p of piecesFor(nodes, headId)) {
-      if (!p.text && !p.generating) continue;
-      const last = bubbles[bubbles.length - 1];
-      if (last && last.role === p.role) last.pieces.push(p);
-      else bubbles.push({ role: p.role, pieces: [p] });
-    }
+    // the same bubbles the model is sent (see bubblesOf)
+    const bubbles: Bubble[] = bubblesOf(piecesFor(nodes, headId));
     const { counts: forks, kids: forkKids } = forkMarks(pathTo(nodes, headId), nodes, children, bubbles);
     return { bubbles, forks, forkKids };
   }, [nodes, children, headId]);
@@ -101,17 +98,34 @@ function RobotButton({ tabId, voice, off }: { tabId: string; voice: Role; off: b
   );
 }
 
+/** What the server says while a generation waits to start (a model booting, a queue). */
+function GenStatus({ bubble }: { bubble: Bubble }) {
+  const p = bubble.pieces.find((x) => x.generating);
+  const text = useUi((s) => (p ? s.status[`${p.nodeId}:${p.msg}`] : undefined));
+  if (!text) return null;
+  return <span className="gen-status">{text}</span>;
+}
+
+/** Shade floor: the least likely tokens still read clearly. */
+const SHADE_FLOOR = 0.42;
+
 const BubbleView = memo(function BubbleView({ bubble, forks, waiting, tail }: { bubble: Bubble; forks: ForkCounts; waiting?: boolean; tail?: ReactNode }) {
   const generating = bubble.pieces.some((p) => p.generating);
+  const shade = useSettings((s) => s.shade);
   return (
     <div className={`bubble ${bubble.role}`}>
       <p>
         {bubble.pieces.map((p) => {
           const base = `${p.nodeId}:${p.msg}:`;
-          return tokenize(p.text).map((tok) => {
+          const toks = tokenize(p.text);
+          return toks.map((tok, i) => {
             if (tok.space) return tok.text;
             // a word is lit where another branch parts in the middle of a message
             const n = forks.get(base + tok.offset) ?? 0;
+            // a model token usually starts at the space before a word (" Hello"): `so` is there
+            const prev = toks[i - 1];
+            const so = prev?.space ? prev.offset : tok.offset;
+            const pr = shade && p.toks ? minProb(p, tok.offset, tok.offset + tok.text.length) : undefined;
             return (
               <span
                 key={`${base}${tok.offset}`}
@@ -119,7 +133,10 @@ const BubbleView = memo(function BubbleView({ bubble, forks, waiting, tail }: { 
                 data-n={p.nodeId}
                 data-m={p.msg}
                 data-o={tok.offset}
+                data-so={so}
                 data-b={n || undefined}
+                data-p={pr === undefined ? undefined : pr < 0.1 ? 'low' : ''}
+                style={pr === undefined ? undefined : ({ '--p': (SHADE_FLOOR + (1 - SHADE_FLOOR) * Math.sqrt(pr)).toFixed(3) } as CSSProperties)}
               >
                 {tok.text}
               </span>
@@ -127,6 +144,7 @@ const BubbleView = memo(function BubbleView({ bubble, forks, waiting, tail }: { 
           });
         })}
         {generating && (waiting ? <span className="waiting">waiting for its turn…</span> : <span className="caret" aria-hidden="true" />)}
+        {generating && !waiting && <GenStatus bubble={bubble} />}
         {tail}
       </p>
     </div>
@@ -224,15 +242,59 @@ function ForkTree({ kids, onPick }: { kids: string[]; onPick: (id: string) => vo
   );
 }
 
-function TokTip({ x, y, branches, text }: { x: number; y: number; branches: number; text: string }) {
+/** The model token under a word (or the one starting at the space before it), and who wrote it. */
+export function modelTokenAt(nodeId: string, msg: number, offset: number, so: number) {
+  const m = useLoom.getState().nodes[nodeId]?.messages[msg];
+  if (!m) return null;
+  const tok = tokenAt(m, offset) ?? tokenAt(m, so);
+  const span = spanAt(m, tok?.o ?? offset);
+  return tok || span ? { tok, span } : null;
+}
+
+/** Is alternative `t` the token that was written? A message's first token lost its leading space. */
+const isWritten = (tok: TokInfo, t: string) => t === tok.t || (tok.o === 0 && t.trimStart() === tok.t);
+
+const when = (at: number) => {
+  const d = new Date(at);
+  return d.toDateString() === new Date().toDateString()
+    ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    : d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+};
+
+function TokTip({ x, y, branches, text, info }: { x: number; y: number; branches: number; text: string; info?: ReturnType<typeof modelTokenAt> }) {
   const ref = useRef<HTMLDivElement>(null);
   const { style } = useNearCursor(ref, x, y, TOOLTIP_GAP);
+  const tok = info?.tok;
   return (
     <div className="tok-tip" style={style} ref={ref} role="tooltip">
+      {tok && (
+        <span className="tok-tip-prob">
+          <code>{showTok(tok.t)}</code> {pct(tok.lp)}
+        </span>
+      )}
+      {tok?.top && tok.top.length > 1 && (
+        <span className="tok-tip-alts">
+          {tok.top
+            .filter(([t]) => !isWritten(tok, t))
+            .slice(0, 4)
+            .map(([t, lp]) => (
+              <span key={t}>
+                <code>{showTok(t)}</code> {pct(lp)}
+              </span>
+            ))}
+        </span>
+      )}
       {text}
       {branches > 0 && (
         <span className="tok-tip-sub">
           {branches} branch{branches > 1 ? 'es' : ''} already split here
+        </span>
+      )}
+      {info?.span && (
+        <span className="tok-tip-sub">
+          {info.span.model} · {when(info.span.at)}
+          {info.span.temp !== undefined ? ` · temp ${info.span.temp}` : ''}
+          {info.span.finish && info.span.finish !== 'stop' ? ` · ${({ length: 'hit max tokens', cancelled: 'stopped' } as Record<string, string>)[info.span.finish] ?? info.span.finish}` : ''}
         </span>
       )}
     </div>
@@ -248,10 +310,16 @@ function ForkMenu({
   onFork,
   onPick,
   onOpen,
+  alts,
+  onAlt,
 }: {
   x: number;
   y: number;
   forks: Branch[];
+  /** the model token here, if the model wrote this word and reported alternatives */
+  alts: TokInfo | null;
+  /** branch off with another token the model considered here */
+  onAlt: (t: string, lp: number) => void;
   /** open the node this point belongs to in a new tab or window */
   onOpen: (where: 'tab' | 'window') => void;
   onClose: () => void;
@@ -259,9 +327,11 @@ function ForkMenu({
   onPick: (nodeId: string) => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
-  const [sub, setSub] = useState<'view' | 'new' | null>(null);
+  const [sub, setSub] = useState<'view' | 'new' | 'alt' | null>(null);
   const viewRow = useRef<HTMLDivElement>(null);
   const newRow = useRef<HTMLDivElement>(null);
+  const altRow = useRef<HTMLDivElement>(null);
+  const altList = alts?.top?.filter(([t]) => !isWritten(alts, t)) ?? [];
   const nodes = useLoom((s) => s.nodes);
   const mobile = useIsMobile();
   const windowsFull = useLoom((s) => s.windows.length >= MAX_WINDOWS);
@@ -323,6 +393,32 @@ function ForkMenu({
           </Flyout>
         )}
       </div>
+      {alts && (
+        <div className="has-sub" ref={altRow} onPointerEnter={(e) => e.pointerType === 'mouse' && altList.length && setSub('alt')} onPointerLeave={(e) => e.pointerType === 'mouse' && setSub(null)}>
+          <button
+            role="menuitem"
+            aria-haspopup="menu"
+            disabled={!altList.length}
+            title={altList.length ? undefined : 'the model reported no alternatives here'}
+            onClick={() => altList.length && setSub('alt')}
+          >
+            branch with another token <span className="chev">›</span>
+          </button>
+          {sub === 'alt' && altList.length > 0 && (
+            <Flyout anchor={altRow}>
+              <p className="menu-title">
+                written: <code>{showTok(alts.t)}</code> {pct(alts.lp)}
+              </p>
+              {altList.map(([t, lp]) => (
+                <button key={t} role="menuitem" className="alt-row" onClick={act(() => onAlt(t, lp))}>
+                  <code>{showTok(t)}</code>
+                  <span className="alt-p">{pct(lp)}</span>
+                </button>
+              ))}
+            </Flyout>
+          )}
+        </div>
+      )}
       <button role="menuitem" onClick={act(() => onOpen('tab'))}>
         open in new tab
       </button>
@@ -355,13 +451,16 @@ function Messages({ tab }: { tab: Tab }) {
   }).split(',').filter(Boolean);
   // the model writes one message at a time: the others wait their turn
   const writing = useLoom((s) => s.streamOrder[0]);
+  // only the in-page model queues; other backends write side by side
+  const queued = useLoom((s) => s.streamOrder);
   const busy = useLoom((s) => !!s.nodes[tab.headId]?.messages.some((m) => m.generating));
   const auto = useChatPrefs((s) => s.autoPrompt);
   const menuOpenedAt = useRef(0);
-  const [menu, setMenu] = useState<(TreePoint & { x: number; y: number; top: boolean }) | null>(null);
+  /** so: where the whitespace before a clicked word starts (= offset for gaps and words without any) */
+  const [menu, setMenu] = useState<(TreePoint & { x: number; y: number; top: boolean; so: number }) | null>(null);
   const forkAtPoint = useLoom((s) => s.forkAtPoint);
   const ref = useRef<HTMLDivElement>(null);
-  const [tip, setTip] = useState<{ x: number; y: number; branches: number; text: string } | null>(null);
+  const [tip, setTip] = useState<{ x: number; y: number; branches: number; text: string; info?: ReturnType<typeof modelTokenAt> } | null>(null);
   const stick = useRef(true);
   /** where the chat last scrolled itself to: a scroll to there is not you looking around */
   const autoTop = useRef(-1);
@@ -396,7 +495,7 @@ function Messages({ tab }: { tab: Tab }) {
   const open = (e: React.MouseEvent, t: HTMLElement) => {
     hideTip();
     menuOpenedAt.current = performance.now();
-    setMenu({ x: e.clientX, y: e.clientY, nodeId: t.dataset.n!, msg: Number(t.dataset.m), offset: Number(t.dataset.o), top: !!t.dataset.top });
+    setMenu({ x: e.clientX, y: e.clientY, nodeId: t.dataset.n!, msg: Number(t.dataset.m), offset: Number(t.dataset.o), top: !!t.dataset.top, so: Number(t.dataset.so ?? t.dataset.o) });
   };
   const lastRole = bubbles[bubbles.length - 1]?.role;
 
@@ -436,7 +535,8 @@ function Messages({ tab }: { tab: Tab }) {
         window.clearTimeout(tipTimer.current);
         setTip(null);
         tipTimer.current = window.setTimeout(() => {
-          setTip({ ...cursor.current, branches: Number(t.dataset.b ?? 0), text: t.dataset.tip ?? 'click to fork at this word' });
+          const info = t.classList.contains('tok') ? modelTokenAt(t.dataset.n!, Number(t.dataset.m), Number(t.dataset.o), Number(t.dataset.so ?? t.dataset.o)) : null;
+          setTip({ ...cursor.current, branches: Number(t.dataset.b ?? 0), text: t.dataset.tip ?? 'click to fork at this word', info });
         }, TOOLTIP_DELAY_MS);
       }}
       onMouseLeave={(e) => {
@@ -467,7 +567,7 @@ function Messages({ tab }: { tab: Tab }) {
             <BubbleView
               bubble={b}
               forks={forks}
-              waiting={!!live && `${live.nodeId}:${live.msg}` !== writing}
+              waiting={!!live && queued.includes(`${live.nodeId}:${live.msg}`) && `${live.nodeId}:${live.msg}` !== writing}
               tail={end && !auto ? <RobotButton tabId={tab.id} voice={b.role} off={busy} /> : undefined}
             />
             {tree && <ForkTree kids={endKids} onPick={(id) => useLoom.getState().goToNode(tab.id, id)} />}
@@ -490,7 +590,18 @@ function Messages({ tab }: { tab: Tab }) {
           y={menu.y}
           forks={forkKids.get(markKey(menu.nodeId, menu.msg, menu.offset, menu.top)) ?? []}
           onClose={() => setMenu(null)}
-          onFork={(kind, count) => forkAtPoint(tab.id, menu.nodeId, menu.msg, menu.offset, kind, count)}
+          alts={menu.top ? null : (modelTokenAt(menu.nodeId, menu.msg, menu.offset, menu.so)?.tok ?? null)}
+          onAlt={(t, lp) => {
+            const info = modelTokenAt(menu.nodeId, menu.msg, menu.offset, menu.so);
+            if (!info?.tok) return;
+            forkAtPoint(tab.id, menu.nodeId, menu.msg, info.tok.o, 'generate', 1, { tok: { t, lp, top: info.tok.top }, model: info.span?.model });
+          }}
+          // at a word the model wrote, it writes on from the start of its own token (" Hello", not
+          // "Hello" after a dangling space), as it would have tokenized the text itself
+          onFork={(kind, count) => {
+            const tok = !menu.top && kind === 'generate' ? modelTokenAt(menu.nodeId, menu.msg, menu.offset, menu.so)?.tok : undefined;
+            forkAtPoint(tab.id, menu.nodeId, menu.msg, tok && tok.o > 0 ? tok.o : menu.offset, kind, count);
+          }}
           onPick={(id) => useLoom.getState().goToNode(tab.id, id)}
           onOpen={(where) => useLoom.getState().openNodeIn(menu.nodeId, where)}
         />
