@@ -10,6 +10,8 @@ import { streamCompletion, type StreamHandle } from './generate';
  * its ancestors' messages, each cut at the next child's fork point, then its own messages.
  */
 
+import { concatGen } from './tokens';
+
 export type Role = 'user' | 'model';
 /** the other voice of the two */
 export const otherRole = (r: Role): Role => (r === 'model' ? 'user' : 'model');
@@ -200,11 +202,20 @@ export interface LoomState {
   toggleSidebar(): void;
   /** point a chat at an existing node */
   goToNode(tabId: string, nodeId: string): void;
+  /** fold a node into its parent, when it carries on from the parent's very end */
+  mergeIntoParent(id: string): void;
+  /** can `id` be merged into its parent? (a reason when it can't) */
+  canMerge(id: string): true | string;
+  /** move the chat you're in through the tree: up to the parent, down to a child, sideways to a sibling */
+  navigate(dir: 'up' | 'down' | 'left' | 'right'): void;
   showToast(text: string): void;
   reset(): void;
 }
 
 // ---------- pure helpers ----------
+
+/** per node: the child last visited from it, so going back down returns where you came from */
+const lastChild = new Map<string, string>();
 
 export function pathTo(nodes: Nodes, id: string): LoomNode[] {
   const out: LoomNode[] = [];
@@ -1072,6 +1083,89 @@ export const useLoom = create<LoomState>()((set, get) => {
       set((s) => ({ sidebarFolded: !s.sidebarFolded }));
     },
 
+    canMerge(id) {
+      const s = get();
+      const N = s.nodes[id];
+      const P = N?.parentId ? s.nodes[N.parentId] : undefined;
+      if (!N || !P || N.isRoot) return 'nothing to merge into';
+      if (P.isRoot) return 'the first node of a thread has no text above it to merge into';
+      if ([...N.messages, ...P.messages].some((m) => m.generating)) return 'wait for the writing to finish';
+      const end = endOf(P);
+      const f = N.forkAt;
+      if (!f || !end || f.msg !== end.msg || f.offset !== end.offset) return 'only a node that carries on from the very end of its parent can merge into it';
+      return true;
+    },
+
+    mergeIntoParent(id) {
+      const ok = get().canMerge(id);
+      if (ok !== true) {
+        get().showToast(`Can't merge: ${ok}`);
+        return;
+      }
+      get().commit();
+      const s = get();
+      const N = s.nodes[id];
+      const P = s.nodes[N.parentId!];
+      const pm = P.messages;
+      const first = N.messages[0];
+      const lastP = pm[pm.length - 1];
+      // the chat shows them as one message when they share a voice, so they become one
+      const join = !!first && !!lastP && first.role === lastP.role;
+      const messages: Message[] = join
+        ? [...pm.slice(0, -1), concatGen(lastP, first), ...N.messages.slice(1)]
+        : [...pm, ...N.messages];
+      const nodes: Nodes = { ...s.nodes, [P.id]: { ...P, messages } };
+      delete nodes[id];
+      const kids = s.children[id] ?? [];
+      for (const c of kids) {
+        const f = nodes[c].forkAt;
+        const forkAt = !f
+          ? f
+          : join
+            ? f.msg === 0
+              ? { msg: pm.length - 1, offset: f.offset + lastP.text.length }
+              : { msg: f.msg + pm.length - 1, offset: f.offset }
+            : { msg: f.msg + pm.length, offset: f.offset };
+        nodes[c] = { ...nodes[c], parentId: P.id, forkAt };
+      }
+      const children: Kids = { ...s.children };
+      const sib = children[P.id] ?? [];
+      const at = sib.indexOf(id);
+      children[P.id] = [...sib.slice(0, at), ...kids, ...sib.slice(at + 1)];
+      delete children[id];
+      // a node never has two tabs: keep the one you're in (else the merged node's), close the rest
+      const onEither = s.tabs.filter((t) => t.headId === id || t.headId === P.id);
+      const keep = onEither.find((t) => t.id === s.activeTabId) ?? onEither.find((t) => t.headId === id) ?? onEither[0];
+      const tabs = s.tabs
+        .filter((t) => !onEither.includes(t) || t === keep)
+        .map((t) => (t === keep ? { ...t, headId: P.id } : t));
+      set({ nodes, children, ...settleWindows(tabs, s.windows, s.activeWindowId), structure: bump() });
+    },
+
+    navigate(dir) {
+      const s = get();
+      const tab = s.tabs.find((t) => t.id === s.activeTabId);
+      const head = tab ? s.nodes[tab.headId] : undefined;
+      if (!tab || !head) return;
+      const kidsOf = (id: string) =>
+        (s.children[id] ?? []).filter((c) => s.nodes[c] && !s.nodes[c].hidden).sort((a, b) => s.nodes[a].x - s.nodes[b].x);
+      let to: string | undefined;
+      if (dir === 'up') {
+        to = head.parentId ?? undefined;
+        if (to) lastChild.set(to, head.id);
+      } else if (dir === 'down') {
+        const kids = kidsOf(head.id);
+        const back = lastChild.get(head.id);
+        to = back && kids.includes(back) ? back : kids[0];
+      } else {
+        if (!head.parentId) return;
+        const sibs = kidsOf(head.parentId);
+        to = sibs[sibs.indexOf(head.id) + (dir === 'left' ? -1 : 1)];
+        if (to) lastChild.set(head.parentId, to);
+      }
+      if (to) get().goToNode(tab.id, to);
+    },
+
     goToNode(tabId, nodeId) {
       const s = get();
       if (!s.nodes[nodeId]) return;
@@ -1086,6 +1180,7 @@ export const useLoom = create<LoomState>()((set, get) => {
     },
 
     reset() {
+      lastChild.clear();
       for (const h of streams.values()) h.cancel();
       streams.clear();
       targets.clear();

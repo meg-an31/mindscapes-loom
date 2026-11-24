@@ -27,6 +27,7 @@ export function NodeMenu() {
   const menu = useUi((s) => s.menu);
   const node = useLoom((s) => (menu ? s.nodes[menu.nodeId] : undefined));
   const canShow = useLoom((s) => (menu ? hasHiddenBelow(s.nodes, s.children, menu.nodeId) : false));
+  const canMerge = useLoom((s) => (menu ? s.canMerge(menu.nodeId) : 'no node'));
   const [sub, setSub] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const forkRow = useRef<HTMLDivElement>(null);
@@ -125,6 +126,9 @@ export function NodeMenu() {
       </button>
       <button role="menuitem" disabled={!canShow} onClick={act(() => L.showAllBelow(node.id))}>
         show all children of this node
+      </button>
+      <button role="menuitem" disabled={canMerge !== true} title={canMerge === true ? 'join this node onto the end of its parent (M)' : canMerge} onClick={act(() => L.mergeIntoParent(node.id))}>
+        merge into parent
       </button>
       <div className="has-sub" ref={forkRow} onPointerEnter={(e) => e.pointerType === 'mouse' && setSub(true)} onPointerLeave={(e) => e.pointerType === 'mouse' && setSub(false)}>
         <button role="menuitem" aria-haspopup="menu" aria-expanded={sub} onClick={() => setSub(true)}>
