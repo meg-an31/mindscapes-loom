@@ -157,7 +157,7 @@ export interface LoomState {
   undo(): void;
   redo(): void;
 
-  /** new leaf child of nodeId (cut at `at`, or after all of it) with a generated model reply */
+  /** new leaf child of nodeId (cut at `at`, or after all of it) where the model writes the next message, in the voice that comes next */
   forkGenerate(nodeId: string, opts?: { at?: ForkAt; pos?: { x: number; y: number } }): string;
   forkMany(nodeId: string, count: number): void;
   /** new empty leaf child, opened in chat so you can type its first message */
@@ -739,7 +739,10 @@ export const useLoom = create<LoomState>()((set, get) => {
         get().openInChat(id, true);
         return id;
       }
-      const id = addChild(nodeId, opts.at ?? endOf(N), [{ role: 'model', text: '', generating: true }], opts.pos);
+      // the voice that comes next, as at the chat's end gap: an answer to the last words
+      const last = lastVoice(get().nodes, nodeId);
+      const voice: Role = last ? otherRole(last) : 'model';
+      const id = addChild(nodeId, opts.at ?? endOf(N), [{ role: voice, text: '', generating: true }], opts.pos);
       startStream(id, 0);
       return id;
     },
