@@ -253,7 +253,11 @@ button { font: inherit; color: inherit; }
   mask-image: linear-gradient(to right, #000 calc(100% - 20px), transparent);
 }
 .tab-name-input {
-  width: 90px;
+  /* takes exactly the name's place, so renaming never widens the tab */
+  flex: 1;
+  min-width: 0;
+  width: 0;
+  padding: 0;
   font: 14px var(--font-head);
   color: var(--ink);
   border: 0;
@@ -359,6 +363,7 @@ button { font: inherit; color: inherit; }
   scrollbar-color: color-mix(in srgb, var(--olive) 30%, transparent) transparent; /* dim until the mouse is over it */
 }
 .col:not(.active) .msgs { background: var(--panel); }
+.col:not(.active) .fork-tree { --line: color-mix(in srgb, #eceaef 45%, var(--panel)); }
 /* the current tab is always the same colour as the chat under it */
 .col:not(.active) .folder-tab.active { background: var(--panel); border-bottom-color: var(--panel); }
 .msgs-empty { color: var(--ink-soft); line-height: 1.55; margin: 8px 4px; font-size: 13.5px; }
@@ -406,7 +411,9 @@ button { font: inherit; color: inherit; }
 .tok.loomed { background: var(--loom); box-shadow: 0 0 0 2px var(--loom); }
 /* branches from the end of the conversation: a Reddit-style thread line into a sideways-scrolling row */
 .fork-tree {
-  --line: rgba(236, 234, 239, 0.45);
+  /* opaque: the same shade a 45% white line would have on the chat background, so where lines
+     cross or meet they don't add up to a brighter spot */
+  --line: color-mix(in srgb, #eceaef 45%, var(--panel-hi));
   display: flex;
   gap: 8px;
   margin-top: -22px; /* cancel the message gap: the stem starts right at the last message */

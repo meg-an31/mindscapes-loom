@@ -841,9 +841,6 @@ function TabMenu({ tabId, x, y, onClose }: { tabId: string; x: number; y: number
       <button role="menuitem" onClick={act(() => L.closeTab(tabId))}>
         close tab
       </button>
-      <button role="menuitem" disabled={win.tabIds.length < 2} onClick={act(() => L.closeOtherTabs(tabId))}>
-        close other tabs
-      </button>
       <button role="menuitem" disabled={i === win.tabIds.length - 1} onClick={act(() => L.closeTabsToRight(tabId))}>
         close tabs to the right
       </button>

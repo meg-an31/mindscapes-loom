@@ -180,7 +180,6 @@ export interface LoomState {
   openNodeIn(id: string, where: 'tab' | 'window'): void;
   newTab(): void;
   closeTab(id: string): void;
-  closeOtherTabs(id: string): void;
   closeTabsToRight(id: string): void;
   closeWindow(id: string): void;
   /** move a tab to a position in a window, or into a new window of its own */
@@ -979,15 +978,6 @@ export const useLoom = create<LoomState>()((set, get) => {
         return { ...w, tabIds, activeTabId: next };
       });
       applyTabs(s.tabs.filter((t) => t.id !== id), windows, s.activeWindowId);
-    },
-
-    closeOtherTabs(id) {
-      const s = get();
-      const w = s.windows.find((x) => x.tabIds.includes(id));
-      if (!w) return;
-      const drop = new Set(w.tabIds.filter((t) => t !== id));
-      const windows = s.windows.map((x) => (x.id === w.id ? { ...x, tabIds: [id], activeTabId: id } : x));
-      applyTabs(s.tabs.filter((t) => !drop.has(t.id)), windows, w.id);
     },
 
     closeTabsToRight(id) {
